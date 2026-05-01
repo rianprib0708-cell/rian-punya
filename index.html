@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Hand-Controlled Particles</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; }
+        #video-container { position: absolute; bottom: 10px; right: 10px; width: 200px; border: 2px solid white; z-index: 10; transform: scaleX(-1); }
+        #ui { position: absolute; top: 10px; left: 10px; color: white; font-family: sans-serif; pointer-events: none; }
+    </style>
+</head>
+<body>
+
+<div id="ui">
+    <h1>Hand Gesture Particles</h1>
+    <p>Pinch fingers to Expand | Move hand to rotate</p>
+    <p id="current-shape">Current Shape: Sphere</p>
+</div>
+<video id="input-video" style="display:none;"></video>
+<canvas id="video-container"></canvas>
+
+<script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// --- MediaPipe Setup ---
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
+
+let handLandmarker;
+let video = document.getElementById("input-video");
+const canvasElement = document.getElementById("video-container");
+const canvasCtx = canvasElement.getContext("2d");
+
+// --- Three.js Setup ---
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const PARTICLE_COUNT = 5000;
+const geometry = new THREE.BufferGeometry();
+const positions = new Float32Array(PARTICLE_COUNT * 3);
+const colors = new Float32Array(PARTICLE_COUNT * 3);
+
+// Templates
+const templates = {
+    sphere: [],
+    heart: [],
+    flower: [],
+    saturn: []
+};
+
+let currentTemplate = 'sphere';
+let targetPositions = new Float32Array(PARTICLE_COUNT * 3);
+let lerpFactor = 0.05;
+
+// Initial Geometry setup
+for (let i = 0; i < PARTICLE_COUNT; i++) {
+    positions[i * 3] = (Math.random() - 0.5) * 10;
+    positions[i * 3 + 1] = (Math.random() - 0.5) * 10;
+    positions[i * 3 + 2] = (Math.random() - 0.5) * 10;
+}
+geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+const material = new THREE.PointsMaterial({
+    size: 0.05,
+    vertexColors: true,
+    transparent: true,
+    blending: THREE.AdditiveBlending
+});
+
+const points = new THREE.Points(geometry, material);
+scene.add(points);
+camera.position.z = 5;
+
+// --- Mathematical Shapes ---
+function generateTemplates() {
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+        // Sphere
+        const phi = Math.acos(-1 + (2 * i) / PARTICLE_COUNT);
+        const theta = Math.sqrt(PARTICLE_COUNT * Math.PI) * phi;
+        templates.sphere.push(2 * Math.cos(theta) * Math.sin(phi), 2 * Math.sin(theta) * Math.sin(phi), 2 * Math.cos(phi));
+
+        // Heart
+        const t = Math.random() * Math.PI * 2;
+        const xH = 16 * Math.pow(Math.sin(t), 3);
+        const yH = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
+        templates.heart.push(xH * 0.1, yH * 0.1, (Math.random() - 0.5) * 0.5);
+
+        // Flower
+        const angle = (i / PARTICLE_COUNT) * Math.PI * 20;
+        const rF = 2 * Math.cos(5/2 * angle);
+        templates.flower.push(rF * Math.cos(angle), rF * Math.sin(angle), (Math.random() - 0.5) * 0.2);
+
+        // Saturn
+        if (i < PARTICLE_COUNT * 0.6) {
+            const sPhi = Math.acos(-1 + (2 * i) / (PARTICLE_COUNT * 0.6));
+            const sTheta = Math.sqrt(PARTICLE_COUNT * 0.6 * Math.PI) * sPhi;
+            templates.saturn.push(1.2 * Math.cos(sTheta) * Math.sin(sPhi), 1.2 * Math.sin(sTheta) * Math.sin(sPhi), 1.2 * Math.cos(sPhi));
+        } else {
+            const rS = 2 + Math.random() * 0.8;
+            const aS = Math.random() * Math.PI * 2;
+            templates.saturn.push(rS * Math.cos(aS), (Math.random() - 0.5) * 0.1, rS * Math.sin(aS));
+        }
+    }
+}
+
+generateTemplates();
+
+// --- Gesture Detection Logic ---
+async function setupHandTracking() {
+    const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm");
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task` },
+        runningMode: "VIDEO", numHands: 1
+    });
+    startCamera();
+}
+
+function startCamera() {
+    navigator.mediaDevices.getUserMedia({ video: true }).then((stream) => {
+        video.srcObject = stream;
+        video.play();
+        video.addEventListener("loadeddata", predictWebcam);
+    });
+}
+
+let lastVideoTime = -1;
+async function predictWebcam() {
+    let startTimeMs = performance.now();
+    if (lastVideoTime !== video.currentTime) {
+        lastVideoTime = video.currentTime;
+        const results = handLandmarker.detectForVideo(video, startTimeMs);
+        
+        if (results.landmarks && results.landmarks.length > 0) {
+            const hand = results.landmarks[0];
+            
+            // 1. Position Control
+            points.rotation.y += (hand[9].x - 0.5) * 0.1;
+            points.rotation.x += (hand[9].y - 0.5) * 0.1;
+
+            // 2. Pinch Distance (Expansion)
+            const distance = Math.sqrt(
+                Math.pow(hand[4].x - hand[8].x, 2) + 
+                Math.pow(hand[4].y - hand[8].y, 2)
+            );
+            const scale = THREE.MathUtils.mapLinear(distance, 0.05, 0.3, 1, 3);
+            points.scale.set(scale, scale, scale);
+
+            // 3. Shape Switching based on Hand height
+            if (hand[9].y < 0.3) switchShape('heart');
+            else if (hand[9].y > 0.7) switchShape('flower');
+            else if (hand[9].x < 0.3) switchShape('saturn');
+            else if (hand[9].x > 0.7) switchShape('sphere');
+
+            // 4. Color Change based on Hand Position
+            const colorAttr = geometry.attributes.color;
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                colorAttr.setXYZ(i, hand[8].x, 1 - hand[8].y, distance * 2);
+            }
+            colorAttr.needsUpdate = true;
+        }
+    }
+    requestAnimationFrame(predictWebcam);
+}
+
+function switchShape(type) {
+    if (currentTemplate === type) return;
+    currentTemplate = type;
+    document.getElementById('current-shape').innerText = `Current Shape: ${type.toUpperCase()}`;
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+    
+    // Smooth Interpolation to Template
+    const posAttr = geometry.attributes.position;
+    const targetArray = templates[currentTemplate];
+    
+    for (let i = 0; i < PARTICLE_COUNT * 3; i++) {
+        posAttr.array[i] += (targetArray[i] - posAttr.array[i]) * lerpFactor;
+    }
+    posAttr.needsUpdate = true;
+    
+    renderer.render(scene, camera);
+}
+
+setupHandTracking();
+animate();
+
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
